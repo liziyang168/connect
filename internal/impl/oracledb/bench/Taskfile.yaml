@@ -37,7 +37,7 @@ tasks:
       - task: pdb:setup
       - task: cdb:setup
       - cmd: echo "Inserting test data, please hold..."
-      - task: sqlcl:pdb:data:users
+      # - task: sqlcl:pdb:data:users
 
   bench:teardown:
     desc: Teardown benchmark

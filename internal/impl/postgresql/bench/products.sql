@@ -11,4 +11,4 @@ SELECT
     'SKU-' || LPAD(n::text, 8, '0'),
     NOW(),
     (n % 10 != 0)
-FROM generate_series(1, 150000) AS n;
+FROM generate_series(1, 100) AS n;

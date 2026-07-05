@@ -13,4 +13,4 @@ SELECT
     (n % 2 = 0),
     n % 100,
     ((n % 1000) + (n % 100) / 100.0)::decimal(10,2)
-FROM generate_series(1, 150000) AS n;
+FROM generate_series(1, 1) AS n;
