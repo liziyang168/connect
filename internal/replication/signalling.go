@@ -53,8 +53,8 @@ func (s *ControlSignal) TableNames(schema string) []string {
 // Signaller detects and communicates signal events from a configured signal channel.
 type Signaller interface {
 	// Listen detects whether a signal has been received from the channel.
-	// Returns true if the event was a signal and should not be published into the pipeline.
-	Listen(ctx context.Context, signal any) (bool, error)
+	// Signal rows are not suppressed; callers should publish them as normal messages.
+	Listen(ctx context.Context, signal any) error
 	// OnSignal returns a channel that receives the LSN of the triggering event each time a signal is detected.
 	OnSignal() <-chan *string
 	// IsPending informs the caller whether a signal is being processed.

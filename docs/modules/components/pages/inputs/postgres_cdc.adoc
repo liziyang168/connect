@@ -564,7 +564,7 @@ Optional external ID for the role assumption.
 
 === `signal_table_name`
 
-The name of the table used to send control signals to the connector. The table must
+The name of the table used to send control signals to the connector, excluding the schema. The table must
 exist in the schema configured via the `schema` field and must have exactly these columns:
 
 - **id** — any type representable as a string (e.g. `SERIAL`, `BIGSERIAL`, `UUID`, `VARCHAR`)
@@ -579,6 +579,17 @@ CREATE TABLE <schema>.<signal_table_name> (
     type VARCHAR(32),
     data TEXT
 );
+```
+
+Signal rows are published as regular output messages (`operation=insert`, `table=<signal_table_name>`).
+To exclude them from downstream processing, filter on the `table` metadata field using a
+`mapping` processor:
+
+```yaml
+pipeline:
+  processors:
+    - mapping: |
+        root = if @table == "rpcn_signal_table" { deleted() } else { this }
 ```
 
 **Supported signals**

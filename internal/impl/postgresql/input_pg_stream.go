@@ -195,7 +195,7 @@ This connector uses the naming pattern ` + "`pglog_stream_<replication_slot_name
 			Optional(),
 		).
 		Field(service.NewStringField(fieldSignalTableName).
-			Description(`The name of the table used to send control signals to the connector. The table must
+			Description(`The name of the table used to send control signals to the connector, excluding the schema. The table must
 exist in the schema configured via the ` + "`schema`" + ` field and must have exactly these columns:
 
 - **id** — any type representable as a string (e.g. ` + "`SERIAL`" + `, ` + "`BIGSERIAL`" + `, ` + "`UUID`" + `, ` + "`VARCHAR`" + `)
@@ -210,6 +210,17 @@ CREATE TABLE <schema>.<signal_table_name> (
     type VARCHAR(32),
     data TEXT
 );
+` + "```" + `
+
+Signal rows are published as regular output messages (` + "`operation=insert`" + `, ` + "`table=<signal_table_name>`" + `).
+To exclude them from downstream processing, filter on the ` + "`table`" + ` metadata field using a
+` + "`mapping`" + ` processor:
+
+` + "```yaml" + `
+pipeline:
+  processors:
+    - mapping: |
+        root = if @table == "rpcn_signal_table" { deleted() } else { this }
 ` + "```" + `
 
 **Supported signals**
@@ -399,9 +410,7 @@ func newPgStreamInput(conf *service.ParsedConfig, mgr *service.Resources) (s ser
 	}
 
 	// Initialise signaller eagerly so IsPending() is safe to call before the first Connect().
-	if i.controlSig, err = NewControlSignaller(schema, signalTableName, logger); err != nil {
-		return nil, fmt.Errorf("unable to create event signaller: %w", err)
-	}
+	i.controlSig = NewControlSignaller(schema, signalTableName, logger)
 
 	// Has stopped is how we notify that we're not connected. This will get reset at connection time.
 	i.stopSig.TriggerHasStopped()
@@ -461,6 +470,7 @@ func (p *pgStreamInput) Connect(ctx context.Context) error {
 	}
 
 	// handle launching snapshots via control signals
+	signalPending := false
 	if pending, signal := p.controlSig.IsPending(); pending && signal.IsSnapshot() {
 		p.logger.Infof("%q signal pending, triggering re-snapshots", signal.Type)
 
@@ -471,7 +481,7 @@ func (p *pgStreamInput) Connect(ctx context.Context) error {
 		p.streamConfig.SnapshotTables = signal.TableNames(p.streamConfig.DBSchema)
 		defer func() { p.streamConfig.SnapshotTables = nil }()
 
-		p.controlSig.Reset()
+		signalPending = true
 	} else {
 		p.streamConfig.StreamOldData = p.streamSnapshot
 	}
@@ -479,6 +489,12 @@ func (p *pgStreamInput) Connect(ctx context.Context) error {
 	pgStream, err := pglogicalstream.NewPgStream(ctx, p.streamConfig)
 	if err != nil {
 		return fmt.Errorf("unable to create replication stream: %w", err)
+	}
+
+	// Reset only after the stream is successfully created so that a failure in
+	// NewPgStream does not silently drop the pending signal on retry.
+	if signalPending {
+		p.controlSig.Reset()
 	}
 
 	batcher, err := p.batching.NewBatcher(p.mgr)
@@ -493,6 +509,7 @@ func (p *pgStreamInput) Connect(ctx context.Context) error {
 }
 
 func (p *pgStreamInput) processStream(pgStream *pglogicalstream.Stream, batcher *service.Batcher) {
+	p.logger.Debug("Launched processing stream")
 	monitorLoop := asyncroutine.NewPeriodic(p.streamConfig.WalMonitorInterval, func() {
 		// Periodically collect stats
 		report := pgStream.GetProgress()
@@ -536,25 +553,15 @@ func (p *pgStreamInput) processStream(pgStream *pglogicalstream.Stream, batcher 
 				break
 			}
 		case batch := <-pgStream.Messages():
+			p.logger.Debug("Received message")
 			var (
 				flush bool
 				mb    []byte
 				err   error
 			)
 			for _, msg := range batch {
-				if isSignal, err := p.controlSig.Listen(ctx, msg); err != nil {
-					p.logger.Errorf("failed to detect if change event was snapshot signal, continuing to process change events: %s", err)
-					continue
-				} else if isSignal {
-					if msg.LSN != nil {
-						if resolveFn, err := cp.Track(ctx, msg.LSN, 0); err == nil {
-							if maxLSN := resolveFn(); maxLSN != nil && *maxLSN != nil {
-								if err := pgStream.AckLSN(ctx, **maxLSN); err != nil {
-									p.logger.Warnf("failed to ack signal LSN: %s", err)
-								}
-							}
-						}
-					}
+				if err := p.controlSig.Listen(ctx, msg); err != nil {
+					p.logger.Errorf("failed to detect snapshot signal in change event, skipping message: %s", err)
 					continue
 				}
 
@@ -598,13 +605,23 @@ func (p *pgStreamInput) processStream(pgStream *pglogicalstream.Stream, batcher 
 					nextTimedBatchChan = time.After(d)
 				}
 			}
-		case <-p.controlSig.OnSignal():
+		case lsn := <-p.controlSig.OnSignal():
 			p.logger.Infof("snapshot signal received, pausing stream to re-run snapshot")
-			// The signal row's LSN was already routed through the checkpointer in
-			// the batch processing path above. Flush any remaining batcher contents
-			// so nothing is stranded, then trigger soft stop.
+			// Flush any batcher contents (including the signal row itself) so they
+			// are tracked in the checkpointer and delivered downstream before we stop.
 			if flushedBatch, err := batcher.Flush(ctx); err == nil {
 				_ = p.flushBatch(ctx, pgStream, cp, flushedBatch)
+			}
+			// Ack the signal LSN directly before stopping so the replication slot
+			// advances past it. The ackFn created by flushBatch above is asynchronous
+			// and runs after the stream has stopped, so the slot would otherwise stay
+			// before the signal row and replay it on every reconnect. Data from the
+			// signaled tables is recovered by the resnapshot, so this is safe for
+			// at-least-once delivery.
+			if lsn != nil {
+				if err := pgStream.AckLSN(ctx, *lsn); err != nil {
+					p.logger.Warnf("failed to ack signal LSN: %s", err)
+				}
 			}
 			p.stopSig.TriggerSoftStop()
 		case err := <-pgStream.Errors():

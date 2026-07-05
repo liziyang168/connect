@@ -220,7 +220,7 @@ postgres_cdc:
 		mu.Unlock()
 	})
 
-	t.Run("Can signal snapshot of one table", func(t *testing.T) {
+	t.Run("Can signal snapshot of one table more than once in a row", func(t *testing.T) {
 		mu.Lock()
 		received = nil // reset to assert for this test
 		mu.Unlock()
@@ -237,6 +237,25 @@ postgres_cdc:
 
 		mu.Lock()
 		require.ElementsMatch(t, received, []any{
+			map[string]any{"operation": "read", "table": "events"},
+			map[string]any{"operation": "read", "table": "events"},
+		})
+		mu.Unlock()
+
+		db.MustExec(`INSERT INTO dbo.rpcn_signal_table (type, data) VALUES ('execute-snapshot', '{"data-collections": ["dbo.events"]}')`)
+
+		// Wait for the re-snapshot to complete: received gains a second read of the
+		// same events row. No signal table row must appear.
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Len(c, received, 4)
+		}, 25*time.Second, 100*time.Millisecond)
+
+		mu.Lock()
+		require.ElementsMatch(t, received, []any{
+			map[string]any{"operation": "read", "table": "events"},
+			map[string]any{"operation": "read", "table": "events"},
 			map[string]any{"operation": "read", "table": "events"},
 			map[string]any{"operation": "read", "table": "events"},
 		})
